@@ -42,7 +42,7 @@ export interface Prompting {
   timeZone: string;
 }
 
-const productBlock = (productContext: string): string =>
+export const productBlock = (productContext: string): string =>
   productContext.trim() === ''
     ? ''
     : `About the product the team works on:\n<product>\n${productContext.trim()}\n</product>\n\n`;
@@ -92,7 +92,7 @@ export function buildContent(input: TriageInput, timeZone: string): Anthropic.Be
 export class TriageError extends Error {}
 
 /** One structured-output call; throws TriageError when nothing usable came back. */
-async function ask<T>(
+export async function ask<T>(
   client: Anthropic,
   model: string,
   system: string,

@@ -1,0 +1,59 @@
+{
+  "promotions": [
+    {
+      "repo": "acme/shop-api",
+      "number": 210,
+      "title": "Release: wishlist and faster checkout",
+      "body": "Promotes staging (#201, #204, #207):\n- #201 ABC-11: Wishlist API\n- #204 ABC-12: Cache shipping rates at checkout\n- #207 ABC-13: Refactor order logging",
+      "mergedAt": "2026-01-15T10:00:00.000Z",
+      "headRef": "staging"
+    },
+    {
+      "repo": "acme/shop-web",
+      "number": 88,
+      "title": "Release: wishlist screen",
+      "body": "Promotes staging (#85):\n- #85 ABC-11: Wishlist screen with a heart button on every product card",
+      "mergedAt": "2026-01-15T10:03:00.000Z",
+      "headRef": "staging"
+    }
+  ],
+  "linked": [
+    {
+      "repo": "acme/shop-api",
+      "number": 201,
+      "title": "ABC-11: Wishlist API",
+      "body": "Adds endpoints to save a product to a wishlist and list saved products. Signed-in customers only.",
+      "mergedAt": "2026-01-14T09:00:00.000Z",
+      "headRef": "feature/wishlist"
+    },
+    {
+      "repo": "acme/shop-api",
+      "number": 204,
+      "title": "ABC-12: Cache shipping rates at checkout",
+      "body": "Shipping rates are cached for 10 minutes; the checkout page loads in about half the time.",
+      "mergedAt": "2026-01-14T11:00:00.000Z",
+      "headRef": "feature/rates-cache"
+    },
+    {
+      "repo": "acme/shop-api",
+      "number": 207,
+      "title": "ABC-13: Refactor order logging",
+      "body": "Internal: moves order logs to the structured logger. No behaviour change.",
+      "mergedAt": "2026-01-14T12:00:00.000Z",
+      "headRef": "chore/order-logs"
+    },
+    {
+      "repo": "acme/shop-web",
+      "number": 85,
+      "title": "ABC-11: Wishlist screen",
+      "body": "A heart button on every product card saves it; the new Wishlist tab in the account menu lists saved products.",
+      "mergedAt": "2026-01-14T15:00:00.000Z",
+      "headRef": "feature/wishlist-screen"
+    }
+  ],
+  "issues": [
+    { "key": "ABC-11", "summary": "Customers want to save products for later", "description": "Several customers asked for a way to keep products they like without adding them to the cart." },
+    { "key": "ABC-12", "summary": "Checkout is slow", "description": "The checkout page takes 4-6 seconds to show shipping options." },
+    { "key": "ABC-13", "summary": "Order logs are unstructured", "description": "Internal clean-up." }
+  ]
+}

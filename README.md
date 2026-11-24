@@ -46,7 +46,43 @@ Guards: only `ALLOWED_CHAT_IDS` are recorded; only `ALLOWED_USER_IDS` (if set) m
 | `CLAUDE_MODEL` | no | `claude-opus-5-5` |
 | `CONTEXT_MESSAGES` / `MAX_IMAGES` / `MAX_TICKETS` / `DAILY_RUN_LIMIT` | no | 50 / 10 / 3 / 30 |
 
+Release announcements (optional, off until its required variables are set — see below):
+
+| Variable | Required | Default |
+|---|---|---|
+| `ANNOUNCE_REPOS` | yes | — comma-separated `owner/name` |
+| `GITHUB_TOKEN` | yes | — fine-grained token, *Pull requests: read* and *Metadata: read* on those repos |
+| `ANNOUNCE_CHANNEL_ID` | yes | — the public channel: `-100…` or `@username` |
+| `ANNOUNCE_TEAM_CHAT_ID` | yes | — the group drafts go to; must be in `ALLOWED_CHAT_IDS` |
+| `ANNOUNCE_APPROVER_IDS` | no | `ALLOWED_USER_IDS` — who may publish, change or cancel; one of the two must be set |
+| `ANNOUNCE_PROD_BRANCH` | no | `main` — merges into it are releases |
+| `ANNOUNCE_QUIET_MINUTES` / `ANNOUNCE_POLL_MINUTES` | no | 10 / 3 |
+| `ANNOUNCE_LANGUAGE` | no | `uk` — the language the post is written in |
+| `ANNOUNCE_STYLE` | no | none — the voice: how to address readers, what to call things |
+| `ANNOUNCE_MAX_REVISIONS` / `ANNOUNCE_DAILY_LIMIT` | no | 5 / 10 (Claude calls a day for drafts and revisions) |
+| `ANNOUNCE_MAX_LINKED_PRS` / `ANNOUNCE_MAX_ISSUES` | no | 30 / 30 |
+| `ANNOUNCE_BLOCKLIST` | no | `staging,stg,prod,dev,eval,hotfix,refactor,merge,pull request,CI,QA,прод,проді,проду,прода,продом,стейдж*,стг` — words a post may not contain: whole words, case-insensitive; a trailing `*` matches a prefix. The Cyrillic entries cover the usual Ukrainian slang for the default language; replace the list for another one |
+| `ANNOUNCE_ALLOW_TERMS` | no | none — names the ticket-key check would reject but a post may use, e.g. `GPT-5,ISO-8601` (exact, case-insensitive; never your own project's keys) |
+
 Cost: one call per trigger — ~50 short messages plus up to 10 screenshots is roughly 15–25k input tokens, about $0.08–0.15 on Opus 5.5.
+
+## Release announcements
+The bot can also write the post that tells your users what shipped.
+
+1. **Detect.** Every `ANNOUNCE_POLL_MINUTES` it asks GitHub for PRs merged into `ANNOUNCE_PROD_BRANCH` of each repo in `ANNOUNCE_REPOS`. Merges that land within `ANNOUNCE_QUIET_MINUTES` of each other are one release; a merge after the draft is out starts the next one. On the very first poll it only notes the time — nothing merged before is announced.
+2. **Draft.** Once the release has been quiet for the window, one Claude call reads the merged PRs, the same-repo PRs their bodies list (`#123`), and the Jira tickets they name, and writes a post for users in `ANNOUNCE_LANGUAGE` and the voice of `ANNOUNCE_STYLE`. Internal-only work is left out. If nothing is visible to users, the bot says so in the team group and proposes no post.
+3. **Check.** Before the team sees it, code rejects a post that names ticket keys (anything shaped like `ABC-123`, except `ANNOUNCE_ALLOW_TERMS`), PR numbers (`#12`, `PR 12`, `pull/12`), branches, repository or Jira links, or a word from `ANNOUNCE_BLOCKLIST`, and asks Claude once more. A post still rejected is shown with the reason and can't be published until it is changed.
+4. **Approve.** The draft appears in `ANNOUNCE_TEAM_CHAT_ID` with *Опублікувати* / *Змінити* / *Скасувати*. Only approvers can press them. The draft always shows the whole post that would be published; only the buttons on the current draft message act — a stale copy is disarmed when pressed. To change it, reply to the draft with what you want; the bot rewrites the same message (up to `ANNOUNCE_MAX_REVISIONS` times).
+5. **Publish.** *Опублікувати* posts the text, exactly as shown, to `ANNOUNCE_CHANNEL_ID` once, and marks the draft with who published it and when. If Telegram refuses (say, the bot isn't an admin), the draft stays and can be published again; if the result is unknown (no answer), the bot never retries — check the channel.
+
+Nothing reaches the channel without a press by an approver. Setup: add the bot to the channel as an administrator with *Post messages*; create the GitHub token; set the variables. A missing required variable turns the feature off (`announce_disabled {missing}` in the logs) and the triage bot keeps working.
+
+To see the exact prompt for a saved release without calling Claude:
+```
+npm run build
+ANNOUNCE_LANGUAGE=uk node dist/announce-sample.js path/to/release.json
+```
+The file holds `{ promotions, linked, issues }` (see `src/__fixtures__/sample-release.json`); a `draft.txt` beside it is run through the post-check.
 
 ## Develop
 ```

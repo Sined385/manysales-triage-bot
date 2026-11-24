@@ -1,7 +1,9 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Bot, type Context } from 'grammy';
-import { loadConfig } from './config.js';
-import { isTrigger, ticketsOf, triggerNote, type Triggers } from './context.js';
+import { Announcer, draftAnnouncement, routeMessage } from './announce.js';
+import { announceSettings, loadConfig } from './config.js';
+import { triggerNote, type Triggers } from './context.js';
+import { GitHub } from './github.js';
 import { Jira } from './jira.js';
 import { errorName, formatReply, plainReply, runTriage, runUpdate, type RunDeps, type RunResult } from './run.js';
 import { Store } from './store.js';
@@ -35,7 +37,7 @@ const allowedUser = (id: number | undefined): boolean =>
   cfg.ALLOWED_USER_IDS.length === 0 || (id !== undefined && cfg.ALLOWED_USER_IDS.includes(id));
 
 function authorOf(ctx: Context): string {
-  const from = ctx.message?.from;
+  const from = ctx.message?.from ?? ctx.callbackQuery?.from;
   if (from === undefined) return 'unknown';
   return [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id);
 }
@@ -50,6 +52,42 @@ async function download(fileId: string): Promise<Uint8Array> {
 
 /** Which chat runs are in flight — a second trigger while one runs is ignored. */
 const running = new Set<number>();
+
+// Release announcements: on only when every required setting is there.
+const settings = announceSettings(cfg);
+const announcer =
+  'disabled' in settings
+    ? null
+    : new Announcer({
+        store,
+        github: new GitHub(settings.githubToken),
+        jira,
+        draft: (input) =>
+          draftAnnouncement(
+            anthropic,
+            cfg.CLAUDE_MODEL,
+            { productContext: settings.productContext, style: settings.style, language: settings.language },
+            input,
+          ),
+        tg: {
+          sendMessage: (chatId, text, other) =>
+            bot.api.sendMessage(chatId, text, {
+              ...(other?.reply_markup === undefined ? {} : { reply_markup: other.reply_markup }),
+              ...(other?.reply_to === undefined ? {} : { reply_parameters: { message_id: other.reply_to } }),
+              link_preview_options: { is_disabled: true },
+            }),
+          editMessageText: (chatId, messageId, text, other) =>
+            bot.api.editMessageText(chatId, messageId, text, {
+              reply_markup: other.reply_markup,
+              link_preview_options: { is_disabled: true },
+            }),
+          editMessageReplyMarkup: (chatId, messageId, other) => bot.api.editMessageReplyMarkup(chatId, messageId, other),
+          answerCallbackQuery: (queryId, other) => bot.api.answerCallbackQuery(queryId, other),
+        },
+        log,
+        now: () => new Date(),
+        settings,
+      });
 
 bot.on('message', async (ctx) => {
   const msg = ctx.message;
@@ -74,11 +112,26 @@ bot.on('message', async (ctx) => {
     imageFileId: photo?.file_id ?? imageDoc?.file_id ?? null,
   });
 
-  if (!allowedUser(msg.from?.id)) return;
-  // A reply to the bot's ticket message updates those tickets.
   const repliedTo = msg.reply_to_message;
-  const keys = repliedTo?.from?.id === ctx.me.id ? ticketsOf(store, chatId, repliedTo.message_id, cfg.JIRA_PROJECT_KEY) : [];
-  if (keys.length === 0 && !isTrigger(text, triggers, ctx.me.username)) return;
+  // A reply to an announcement draft belongs to the announcer; a reply to the
+  // bot's ticket message updates those tickets; a trigger files new ones.
+  const route = routeMessage({
+    store,
+    announcing: announcer !== null,
+    chatId,
+    text,
+    repliedTo: repliedTo === undefined ? undefined : { messageId: repliedTo.message_id, fromId: repliedTo.from?.id },
+    me: { id: ctx.me.id, username: ctx.me.username },
+    triggers,
+    projectKey: cfg.JIRA_PROJECT_KEY,
+    userAllowed: allowedUser(msg.from?.id),
+  });
+  if (route.kind === 'draft') {
+    void announcer?.onReply(route.release, { messageId: msg.message_id, text, userId: msg.from?.id });
+    return;
+  }
+  if (route.kind === 'none') return;
+  const keys = route.kind === 'update' ? route.keys : [];
   if (running.has(chatId)) return;
   const day = new Date().toISOString().slice(0, 10);
   if (!store.takeRun(day, cfg.DAILY_RUN_LIMIT)) {
@@ -164,10 +217,30 @@ async function handleRun(
   }
 }
 
+bot.on('callback_query:data', (ctx) => {
+  // Off: still answer, or the client spins on an old draft's button.
+  if (announcer === null) return void ctx.answerCallbackQuery().catch(() => undefined);
+  // Not awaited: a publish waits on Telegram, and the group must keep being recorded meanwhile.
+  void announcer.onCallback({
+    id: ctx.callbackQuery.id,
+    data: ctx.callbackQuery.data,
+    chatId: ctx.callbackQuery.message?.chat.id,
+    messageId: ctx.callbackQuery.message?.message_id,
+    user: { id: ctx.from.id, name: authorOf(ctx) },
+  });
+});
+
 bot.catch((err) => log('bot_error', { error: errorName(err.error) }));
 
-process.once('SIGTERM', () => void bot.stop());
-process.once('SIGINT', () => void bot.stop());
+let pollTimer: NodeJS.Timeout | undefined;
+let stopped = false;
+const stop = (): void => {
+  stopped = true;
+  clearTimeout(pollTimer);
+  void bot.stop();
+};
+process.once('SIGTERM', stop);
+process.once('SIGINT', stop);
 
 await bot.init();
 // False means BotFather privacy mode is on: the bot gets only commands and
@@ -175,4 +248,19 @@ await bot.init();
 const readsAll = bot.botInfo.can_read_all_group_messages;
 log('starting', { chats: cfg.ALLOWED_CHAT_IDS.length, model: cfg.CLAUDE_MODEL, readsAllGroupMessages: readsAll });
 if (!readsAll) log('privacy_mode_on', { fix: 'BotFather /setprivacy Disable, then remove and re-add the bot' });
-await bot.start({ allowed_updates: ['message'], drop_pending_updates: false });
+if ('disabled' in settings) {
+  log('announce_disabled', { missing: settings.missing });
+} else if (announcer !== null) {
+  announcer.startup();
+  log('announce_started', { repos: settings.repos.length, pollMinutes: settings.pollMinutes });
+  // A chain, not an interval: a slow tick delays the next one instead of overlapping it.
+  const loop = async (): Promise<void> => {
+    await announcer.tick();
+    // A tick still running at SIGTERM must not schedule another.
+    if (stopped) return;
+    pollTimer = setTimeout(() => void loop(), settings.pollMinutes * 60_000);
+  };
+  void loop();
+}
+// Telegram remembers allowed_updates between calls, so callback_query is always asked for.
+await bot.start({ allowed_updates: ['message', 'callback_query'], drop_pending_updates: false });
