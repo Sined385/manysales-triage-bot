@@ -61,7 +61,7 @@ Release announcements (optional, off until its required variables are set — se
 | `ANNOUNCE_STYLE` | no | none — the voice: how to address readers, what to call things |
 | `ANNOUNCE_MAX_REVISIONS` / `ANNOUNCE_DAILY_LIMIT` | no | 5 / 10 (Claude calls a day for drafts and revisions) |
 | `ANNOUNCE_MAX_LINKED_PRS` / `ANNOUNCE_MAX_ISSUES` | no | 30 / 30 |
-| `ANNOUNCE_BLOCKLIST` | no | `staging,stg,prod,dev,eval,hotfix,refactor,merge,pull request,CI,QA,прод,проді,проду,прода,продом,стейдж*,стейджинг*,стг` — words a post may not contain: whole words, case-insensitive; a trailing `*` matches a prefix. The Cyrillic entries cover the usual Ukrainian slang for the default language; replace the list for another one |
+| `ANNOUNCE_BLOCKLIST` | no | `staging,stg,prod,dev,eval,hotfix,refactor,merge,pull request,CI,QA,прод,проді,проду,прода,продом,стейдж*,стг` — words a post may not contain: whole words, case-insensitive; a trailing `*` matches a prefix. The Cyrillic entries cover the usual Ukrainian slang for the default language; replace the list for another one |
 | `ANNOUNCE_ALLOW_TERMS` | no | none — names the ticket-key check would reject but a post may use, e.g. `GPT-5,ISO-8601` (exact, case-insensitive; never your own project's keys) |
 
 Cost: one call per trigger — ~50 short messages plus up to 10 screenshots is roughly 15–25k input tokens, about $0.08–0.15 on Opus 5.5.

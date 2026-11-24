@@ -62,7 +62,7 @@ describe('announce config', () => {
     expect(c.ANNOUNCE_MAX_ISSUES).toBe(30);
     expect(c.ANNOUNCE_BLOCKLIST).toEqual([
       'staging', 'stg', 'prod', 'dev', 'eval', 'hotfix', 'refactor', 'merge', 'pull request', 'CI', 'QA',
-      'прод', 'проді', 'проду', 'прода', 'продом', 'стейдж*', 'стейджинг*', 'стг',
+      'прод', 'проді', 'проду', 'прода', 'продом', 'стейдж*', 'стг',
     ]);
     expect(c.ANNOUNCE_ALLOW_TERMS).toEqual([]);
   });
@@ -1321,6 +1321,8 @@ describe('a revision whose edit has no answer', () => {
     await replyTo(h, 'зміни');
     expect(h.store.release(1)!.flagged).toEqual([]);
     expect(h.store.release(1)!.draftText).toBe(POST);
+    // Nothing changed, so nothing is counted.
+    expect(h.store.release(1)!.revisions).toBe(0);
   });
 });
 
@@ -1390,9 +1392,11 @@ describe('post-check, round 2', () => {
   it.each([
     ['github.com/acme/shop-api/pull/3', 'посилання на репозиторій'],
     ['see www.gitlab.com/o/r', 'посилання на репозиторій'],
-    ['PR 512', 'номер PR PR 512'],
-    ['pr#7 merged', 'номер PR pr#7'],
-    ['see pull/512', 'номер PR pull/512'],
+    ['PR 512', 'номер PR #512'],
+    ['pr#7 merged', 'номер PR #7'],
+    ['see pull/512', 'номер PR #512'],
+    ['https://api.github.com/repos/o/r', 'посилання на репозиторій'],
+    ['api.github.com/repos/o/r', 'посилання на репозиторій'],
     ['Тікет ABC 12', 'ключ тікета ABC 12'],
     ['вже на проді', 'службове слово «проді»'],
     ['викотили на прод', 'службове слово «прод»'],
@@ -1438,4 +1442,87 @@ describe('announce config, round 2', () => {
     );
     expect(announceSettings(loadConfig({ ...full, GITHUB_TOKEN: '   ' }))).toEqual({ disabled: true, missing: ['GITHUB_TOKEN'] });
   });
+});
+
+// --- QA round 2 ---
+
+describe('an unsure edit at the revision cap', () => {
+  it('the last allowed revision with no Telegram answer is not counted; the next reply repairs it and Publish works', async () => {
+    const h = harness({ maxRevisions: 2 });
+    await drafted(h);
+    await replyTo(h, 'перша');
+    expect(h.store.release(1)!.revisions).toBe(1);
+    h.tg.editMessageText.mockRejectedValueOnce(new HttpError('Network request failed', new Error('timeout')));
+    h.draft.mockResolvedValueOnce(ok('друга версія'));
+    await replyTo(h, 'друга');
+    let r = h.store.release(1)!;
+    expect(r.revisions).toBe(1);
+    expect(r.flagged).toEqual([TEXT.editUnknown]);
+    h.draft.mockResolvedValueOnce(ok('третя версія'));
+    await replyTo(h, 'ще раз', APPROVER.id, 777);
+    r = h.store.release(1)!;
+    expect(r.revisions).toBe(2);
+    expect(r.flagged).toEqual([]);
+    await press(h, 'p');
+    expect(h.channelSends()).toEqual([['@acme_news', 'третя версія']]);
+  });
+
+  it('a draft at the cap whose edit is unsure still takes a reply and a Change press', async () => {
+    const h = harness({ maxRevisions: 2 });
+    await drafted(h);
+    const r = h.store.release(1)!;
+    h.store.saveDraft(1, {
+      chatId: TEAM,
+      messageId: r.draftMessageId!,
+      text: 'невідомо що видно',
+      note: '',
+      flagged: [TEXT.editUnknown],
+      revisions: 2,
+    });
+    await press(h, 'e');
+    expect(h.tg.answerCallbackQuery).toHaveBeenLastCalledWith('q1', { text: TEXT.editHint(1) });
+    expect(h.store.release(1)!.state).toBe('editing');
+    h.draft.mockResolvedValueOnce(ok('виправлено'));
+    await replyTo(h, 'покажи ще раз');
+    expect(h.draft).toHaveBeenCalledTimes(2);
+    expect(h.store.release(1)!.flagged).toEqual([]);
+    expect(h.store.release(1)!.revisions).toBe(3);
+    // A clean draft at the cap is capped again.
+    await replyTo(h, 'ще', APPROVER.id, 778);
+    expect(h.draft).toHaveBeenCalledTimes(2);
+    expect(h.tg.sendMessage).toHaveBeenLastCalledWith(TEAM, TEXT.revisionsExhausted, { reply_to: 778 });
+  });
+});
+
+describe('a stale press whose button strip fails', () => {
+  it('is logged and answered, never thrown', async () => {
+    const h = harness();
+    const draftId = await drafted(h);
+    h.tg.editMessageReplyMarkup.mockRejectedValueOnce(new HttpError('Network request failed', new Error('reset')));
+    await expect(press(h, 'p', APPROVER, 'q1', TEAM, draftId - 1)).resolves.toBeUndefined();
+    expect(h.events('announce_edit_failed')).toEqual([{ releaseId: 1, error: 'HttpError' }]);
+    expect(h.tg.answerCallbackQuery).toHaveBeenLastCalledWith('q1', { text: TEXT.closed, show_alert: true });
+    expect(h.store.release(1)!.state).toBe('drafted');
+    expect(h.channelSends()).toHaveLength(0);
+  });
+});
+
+describe('post-check, round 3', () => {
+  it.each([
+    ['MANY', 'Many 5-star reviews this week.'],
+    ['APP', 'Нова версія App 2.0 вже доступна.'],
+    ['SHOP', 'Shop 24/7 тепер відкритий.'],
+  ])('key %s: an ordinary word before a number passes', (projectKey, text) => {
+    expect(checkPost(text, { ...CHECK, projectKey })).toEqual([]);
+  });
+
+  it('the capitalised key with a space is still a ticket key; the dash form is case-insensitive', () => {
+    expect(checkPost('Тікет MANY 12', { ...CHECK, projectKey: 'MANY' })).toEqual(['ключ тікета MANY 12']);
+    expect(checkPost('see many-12', { ...CHECK, projectKey: 'MANY' })).toEqual(['ключ тікета many-12']);
+  });
+
+  it.each([
+    ['see PR #12', ['номер PR #12']],
+    ['на стейджингу', ['службове слово «стейдж*»']],
+  ])('%j is reported once', (text, findings) => expect(checkPost(text, CHECK)).toEqual(findings));
 });

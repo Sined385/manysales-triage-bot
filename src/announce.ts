@@ -232,13 +232,17 @@ export function checkPost(text: string, opts: CheckOptions): string[] {
   if (text.length > MAX_POST_CHARS) add(`задовгий текст (${String(text.length)} > ${String(MAX_POST_CHARS)})`);
 
   const key = escapeRegExp(opts.projectKey);
-  for (const m of text.matchAll(new RegExp(`\\b${key}(?:-|\\s+)\\d+\\b`, 'gi'))) add(`ключ тікета ${m[0]}`);
+  for (const m of text.matchAll(new RegExp(`\\b${key}-\\d+\\b`, 'gi'))) add(`ключ тікета ${m[0]}`);
+  // «ABC 12» only as written in capitals: «Many 5-star reviews» is a sentence, not MANY-5.
+  for (const m of text.matchAll(new RegExp(`\\b${key}\\s+\\d+\\b`, 'g'))) add(`ключ тікета ${m[0]}`);
   const allowed = new Set((opts.allow ?? []).map((a) => a.trim().toLowerCase()).filter((a) => a !== ''));
   for (const m of text.matchAll(/\b[A-Z][A-Z0-9]{1,9}-\d{1,6}\b/g)) {
     if (!allowed.has(m[0].toLowerCase())) add(`ключ тікета ${m[0]}`);
   }
-  for (const m of text.matchAll(/(?:^|[\s(])(#\d+)\b/g)) add(`номер PR ${m[1]!}`);
-  for (const m of text.matchAll(/\bPR\s*#?\d+\b|\bpull\/\d+\b/gi)) add(`номер PR ${m[0]}`);
+  // Every PR-number form is reported as «#N», so «PR #12» is one finding, not two.
+  for (const m of text.matchAll(/(?:^|[\s(])#(\d+)\b|\bPR\s*#?(\d+)\b|\bpull\/(\d+)\b/gi)) {
+    add(`номер PR #${m[1] ?? m[2] ?? m[3]!}`);
+  }
 
   const branches = ['stg', 'staging', 'dev', 'prod'];
   const prod = opts.prodBranch.trim().toLowerCase();
@@ -248,7 +252,7 @@ export function checkPost(text: string, opts: CheckOptions): string[] {
   const mainBranch = /\b(main|master)\b\s*(→|->|\/)|(→|->|\/)\s*\b(main|master)\b|\b(main|master) branch\b/i.exec(text);
   if (mainBranch !== null) add(`гілка ${(mainBranch[1] ?? mainBranch[4] ?? mainBranch[5] ?? '').toLowerCase()}`);
 
-  if (/(?<![\w.-])(https?:\/\/)?(www\.)?(github\.com|gitlab\.com|bitbucket\.org)\//i.test(text)) add('посилання на репозиторій');
+  if (/(?<![\w.-])(https?:\/\/)?([\w-]+\.)*(github\.com|gitlab\.com|bitbucket\.org)\//i.test(text)) add('посилання на репозиторій');
   let jiraHost = '';
   try {
     jiraHost = new URL(opts.jiraBaseUrl).host.toLowerCase();
@@ -778,7 +782,9 @@ export class Announcer {
   }
 
   private async startEdit(queryId: string, r: Release): Promise<void> {
-    const left = this.s.maxRevisions - r.revisions;
+    // A draft whose last edit is unsure can always be revised: it can't be published otherwise.
+    const unsure = r.flagged.includes(TEXT.editUnknown);
+    const left = unsure ? Math.max(1, this.s.maxRevisions - r.revisions) : this.s.maxRevisions - r.revisions;
     if (r.state !== 'drafted' && r.state !== 'editing') return this.answer(queryId, r.id, this.busy(r.state), true);
     if (left <= 0) return this.answer(queryId, r.id, TEXT.revisionsExhausted, true);
     if (r.state === 'drafted') {
@@ -812,7 +818,8 @@ export class Announcer {
         (err: unknown) => log('announce_team_send_failed', { releaseId: r.id, error: errorName(err) }),
       );
     if (r.state !== 'drafted' && r.state !== 'editing') return say(this.busy(r.state));
-    if (r.revisions >= this.s.maxRevisions) return say(TEXT.revisionsExhausted);
+    // Past the cap only to repair an unsure edit, or the release could never be published.
+    if (r.revisions >= this.s.maxRevisions && !r.flagged.includes(TEXT.editUnknown)) return say(TEXT.revisionsExhausted);
     if (!store.setState(r.id, ['drafted', 'editing'], 'revising')) return say(TEXT.wait);
     if (!this.takeRun()) {
       store.setState(r.id, ['revising'], 'drafted');
@@ -828,8 +835,9 @@ export class Announcer {
         instructions: reply.text,
       });
       const revisions = r.revisions + 1;
-      const save = (text: string, note: string, flagged: string[]): void =>
-        store.saveDraft(r.id, { chatId, messageId: r.draftMessageId!, text, note, flagged, revisions });
+      // Only a revision the team surely sees counts against the cap.
+      const save = (text: string, note: string, flagged: string[], counted = revisions): void =>
+        store.saveDraft(r.id, { chatId, messageId: r.draftMessageId!, text, note, flagged, revisions: counted });
       if (result.nothing_to_announce || result.post === '') {
         save(r.draftText, r.teamNote, r.flagged);
         store.setState(r.id, ['revising'], 'drafted');
@@ -854,12 +862,12 @@ export class Announcer {
       } catch (err) {
         if (err instanceof GrammyError) {
           // Telegram said no: the old text is still what the team sees.
-          save(r.draftText, r.teamNote, r.flagged);
+          save(r.draftText, r.teamNote, r.flagged, r.revisions);
           throw err;
         }
         // No answer: the team may see either text. Keep the new one, withheld from Publish.
         const unsure = [TEXT.editUnknown, ...findings];
-        save(result.post, result.team_note, unsure);
+        save(result.post, result.team_note, unsure, r.revisions);
         await this.edit(r, draftMessage({ ...next, flagged: unsure }, prs), keyboard(r.id, unsure));
         store.setState(r.id, ['revising'], 'drafted');
         log('announce_revision_unknown', { releaseId: r.id, error: errorName(err) });

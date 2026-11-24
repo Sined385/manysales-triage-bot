@@ -22,7 +22,7 @@ const csv = (fallback: string) =>
 // Whole words, case-insensitive; a trailing `*` matches as a prefix. The Cyrillic ones
 // are the usual Ukrainian slang for the default language `uk` («на проді», «на стейджингу»).
 export const DEFAULT_BLOCKLIST =
-  'staging,stg,prod,dev,eval,hotfix,refactor,merge,pull request,CI,QA,прод,проді,проду,прода,продом,стейдж*,стейджинг*,стг';
+  'staging,stg,prod,dev,eval,hotfix,refactor,merge,pull request,CI,QA,прод,проді,проду,прода,продом,стейдж*,стг';
 
 const EnvSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
