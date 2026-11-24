@@ -326,7 +326,7 @@ function draftMessage(r: Pick<Release, 'id' | 'flagged' | 'teamNote' | 'draftTex
       TEXT.header(r.id, prs),
       r.flagged.length > 0 ? TEXT.flagged(r.flagged) : '',
       hintLeft === undefined ? '' : TEXT.editHint(hintLeft),
-      r.teamNote === '' ? '' : TEXT.note(capNote(r.teamNote)),
+      r.teamNote === '' ? '' : TEXT.note(r.teamNote),
     ],
     r.draftText,
   );
