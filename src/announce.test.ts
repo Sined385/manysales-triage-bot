@@ -6,12 +6,15 @@ import {
   announcePrompt,
   buildAnnounceContent,
   checkPost,
+  composeMessage,
   draftAnnouncement,
   extractIssueKeys,
   extractRefs,
   keyboard,
   limitSources,
   MAX_INPUT_CHARS,
+  MAX_MESSAGE_CHARS,
+  MAX_NOTE_CHARS,
   routeMessage,
   TEXT,
   type Announcement,
@@ -59,7 +62,9 @@ describe('announce config', () => {
     expect(c.ANNOUNCE_MAX_ISSUES).toBe(30);
     expect(c.ANNOUNCE_BLOCKLIST).toEqual([
       'staging', 'stg', 'prod', 'dev', 'eval', 'hotfix', 'refactor', 'merge', 'pull request', 'CI', 'QA',
+      'прод', 'проді', 'проду', 'прода', 'продом', 'стейдж*', 'стейджинг*', 'стг',
     ]);
+    expect(c.ANNOUNCE_ALLOW_TERMS).toEqual([]);
   });
 
   it('is off, naming what is missing, when no announcement variable is set', () => {
@@ -109,7 +114,7 @@ describe('announce store', () => {
     expect(s.cursor('a/b')).toBeNull();
     s.setCursor('a/b', '2026-01-01T00:00:00.000Z');
     s.setCursor('a/b', '2026-01-02T00:00:00.000Z');
-    expect(s.cursor('a/b')).toBe('2026-01-02T00:00:00.000Z');
+    expect(s.cursor('a/b')).toEqual({ since: '2026-01-02T00:00:00.000Z', baseline: '2026-01-01T00:00:00.000Z' });
     expect(s.cursor('a/c')).toBeNull();
   });
 
@@ -516,6 +521,7 @@ const SETTINGS: AnnounceSettings = {
   maxLinkedPrs: 30,
   maxIssues: 30,
   blocklist: DEFAULT_BLOCKLIST.split(','),
+  allowTerms: [],
   projectKey: 'ABC',
   jiraBaseUrl: 'https://your-team.atlassian.net',
   // Not the dev box's zone: a time printed in it proves the zone was used.
@@ -538,7 +544,7 @@ function harness(settings: Partial<AnnounceSettings> = {}, store = new Store(':m
     headRef: 'staging',
   });
   const github = {
-    listMergedPulls: vi.fn(async (repo: string) => pulls[repo] ?? []),
+    listMergedPulls: vi.fn(async (repo: string, _base: string, _since: string) => pulls[repo] ?? []),
     getPull: vi.fn(async (repo: string, n: number) => mkPull(repo, n, min(-100), `linked body ${String(n)}`)),
   };
   const jira = { getIssue: vi.fn(async (key: string) => ({ summary: `summary ${key}`, description: 'description' })) };
@@ -547,6 +553,7 @@ function harness(settings: Partial<AnnounceSettings> = {}, store = new Store(':m
   const tg = {
     sendMessage: vi.fn(async (_chat: number | string, _text: string, _other?: object) => ({ message_id: ++nextId })),
     editMessageText: vi.fn(async (_chat: number, _id: number, _text: string, _other: object) => true as unknown),
+    editMessageReplyMarkup: vi.fn(async (_chat: number, _id: number, _other: object) => true as unknown),
     answerCallbackQuery: vi.fn(async (_id: string, _other?: object) => true as unknown),
   };
   const log = vi.fn();
@@ -593,8 +600,15 @@ async function drafted(h: H): Promise<number> {
   return r.draftMessageId!;
 }
 
-const press = (h: H, action: 'p' | 'e' | 'x', user = APPROVER, queryId = 'q1', chatId: number = TEAM) =>
-  h.announcer.onCallback({ id: queryId, data: `an:${action}:1`, chatId, user });
+/** A press on release 1's draft message (or on `messageId`, a stale copy). */
+const press = (h: H, action: 'p' | 'e' | 'x', user = APPROVER, queryId = 'q1', chatId: number = TEAM, messageId?: number) =>
+  h.announcer.onCallback({
+    id: queryId,
+    data: `an:${action}:1`,
+    chatId,
+    messageId: messageId ?? h.store.release(1)?.draftMessageId ?? undefined,
+    user,
+  });
 
 const replyTo = (h: H, text: string, userId: number | undefined = APPROVER.id, messageId = 500) =>
   h.announcer.onReply(h.store.release(1)!, { messageId, text, userId });
@@ -603,8 +617,8 @@ describe('announcer: polling and grouping', () => {
   it('first tick sets the cursor to now, fetches nothing and opens no release', async () => {
     const h = harness();
     await h.announcer.tick();
-    expect(h.store.cursor('acme/shop-api')).toBe('2026-01-15T10:00:00.000Z');
-    expect(h.store.cursor('acme/shop-web')).toBe('2026-01-15T10:00:00.000Z');
+    expect(h.store.cursor('acme/shop-api')?.since).toBe('2026-01-15T10:00:00.000Z');
+    expect(h.store.cursor('acme/shop-web')?.baseline).toBe('2026-01-15T10:00:00.000Z');
     expect(h.github.listMergedPulls).not.toHaveBeenCalled();
     expect(h.events('announce_baseline')).toEqual([{ repo: 'acme/shop-api' }, { repo: 'acme/shop-web' }]);
     expect(h.store.openRelease()).toBeNull();
@@ -628,9 +642,9 @@ describe('announcer: polling and grouping', () => {
     expect(h.store.prsOf(open.id).map((p) => p.number)).toEqual([210, 212]);
     expect(open.lastMergeAt).toBe(min(4).toISOString());
     expect(h.store.releasesIn(['collecting'])).toHaveLength(1);
-    expect(h.store.cursor('acme/shop-api')).toBe(min(4).toISOString());
-    // Asked with an overlap of two poll intervals before the cursor.
-    expect(h.github.listMergedPulls).toHaveBeenCalledWith('acme/shop-api', 'prod', min(-6).toISOString());
+    expect(h.store.cursor('acme/shop-api')?.since).toBe(min(4).toISOString());
+    // Never asked for anything before the baseline.
+    expect(h.github.listMergedPulls).toHaveBeenCalledWith('acme/shop-api', 'prod', min(0).toISOString());
 
     h.at(min(8));
     await h.announcer.tick();
@@ -740,7 +754,7 @@ describe('announcer: restarts', () => {
     expect(h.store.release(1)!.state).toBe('publishing');
     expect(h.channelSends()).toHaveLength(0);
     expect(h.events('announce_resumed_publishing')).toEqual([{ releaseId: 1 }]);
-    await a.onCallback({ id: 'q', data: 'an:p:1', chatId: TEAM, user: APPROVER });
+    await a.onCallback({ id: 'q', data: 'an:p:1', chatId: TEAM, messageId: h.store.release(1)!.draftMessageId!, user: APPROVER });
     expect(h.channelSends()).toHaveLength(0);
   });
 
@@ -839,8 +853,8 @@ describe('announcer: failures', () => {
     h.at(min(5));
     await h.announcer.tick();
     expect(h.events('announce_github_failed')).toEqual([{ repo: 'acme/shop-api', error: 'Error:403' }]);
-    expect(h.store.cursor('acme/shop-api')).toBe(min(0).toISOString());
-    expect(h.store.cursor('acme/shop-web')).toBe(min(4).toISOString());
+    expect(h.store.cursor('acme/shop-api')?.since).toBe(min(0).toISOString());
+    expect(h.store.cursor('acme/shop-web')?.since).toBe(min(4).toISOString());
     expect(h.store.prsOf(1).map((p) => p.number)).toEqual([88]);
   });
 
@@ -1000,8 +1014,8 @@ describe('announcer: buttons', () => {
     const h = harness();
     await drafted(h);
     await press(h, 'p', APPROVER, 'q1', -100999);
-    await h.announcer.onCallback({ id: 'q2', data: 'an:p:42', chatId: TEAM, user: APPROVER });
-    await h.announcer.onCallback({ id: 'q3', data: 'other:1', chatId: TEAM, user: APPROVER });
+    await h.announcer.onCallback({ id: 'q2', data: 'an:p:42', chatId: TEAM, messageId: 1, user: APPROVER });
+    await h.announcer.onCallback({ id: 'q3', data: 'other:1', chatId: TEAM, messageId: 1, user: APPROVER });
     expect(h.channelSends()).toHaveLength(0);
     expect(h.tg.answerCallbackQuery).toHaveBeenCalledWith('q2', { text: TEXT.closed, show_alert: true });
     expect(h.tg.answerCallbackQuery.mock.calls.map((c) => c[0])).toEqual(['q1', 'q2']);
@@ -1173,5 +1187,255 @@ describe('announcer: logs', () => {
     ]) {
       expect(logged).not.toContain(secret);
     }
+  });
+});
+
+// --- QA round 1 ---
+
+describe('the draft shows exactly what Publish posts', () => {
+  it('composeMessage never cuts a post that passed the check; the header gives way', () => {
+    const post = 'п'.repeat(3800);
+    const text = composeMessage(['Чернетка анонсу (реліз #1, PR: 2)', `Для команди: ${'примітка '.repeat(600)}`], post);
+    expect(text.length).toBeLessThanOrEqual(MAX_MESSAGE_CHARS);
+    expect(text.endsWith(`\n\n${post}`)).toBe(true);
+    expect(text.startsWith('Чернетка анонсу (реліз #1, PR: 2)')).toBe(true);
+  });
+
+  it('a long team note: the team message holds the full post and Publish sends that same text', async () => {
+    const h = harness();
+    const post = 'п'.repeat(3759);
+    h.draft.mockResolvedValue({ nothing_to_announce: false, post, team_note: 'примітка '.repeat(60) });
+    await drafted(h);
+    const [, text] = h.teamSends()[0]!;
+    expect(text.length).toBeLessThanOrEqual(MAX_MESSAGE_CHARS);
+    expect(text).toContain(`\n\n${post}`);
+    expect(h.store.release(1)!.teamNote.length).toBeLessThanOrEqual(MAX_NOTE_CHARS);
+    await press(h, 'p');
+    expect(h.channelSends()).toEqual([['@acme_news', post]]);
+  });
+
+  it('a long note on an empty release still fits one message', async () => {
+    const h = harness();
+    h.draft.mockResolvedValue({ nothing_to_announce: true, post: '', team_note: 'примітка '.repeat(800) });
+    await collect(h);
+    h.at(min(14));
+    await h.announcer.tick();
+    expect(h.store.release(1)!.state).toBe('empty');
+    expect(h.teamSends()[0]![1].length).toBeLessThanOrEqual(MAX_MESSAGE_CHARS);
+  });
+
+  it('draftAnnouncement caps the team note', async () => {
+    const parse = vi.fn(async () => ({
+      stop_reason: 'end_turn',
+      parsed_output: { nothing_to_announce: false, post: 'p', team_note: 'n'.repeat(1000) },
+    }));
+    const r = await draftAnnouncement({ beta: { messages: { parse } } } as never, 'm', { productContext: '', style: '', language: 'uk' }, {
+      promotions: [],
+      linked: [],
+      issues: [],
+      language: 'uk',
+    });
+    expect(r.team_note).toHaveLength(MAX_NOTE_CHARS);
+  });
+});
+
+describe('a press on a stale copy of the draft', () => {
+  it.each(['p', 'x', 'e'] as const)('%s on another message of the same release: refused, its buttons removed, nothing changes', async (action) => {
+    const h = harness();
+    const draftId = await drafted(h);
+    const stale = draftId - 1;
+    await press(h, action, APPROVER, 'q1', TEAM, stale);
+    expect(h.store.release(1)!.state).toBe('drafted');
+    expect(h.channelSends()).toHaveLength(0);
+    expect(h.tg.editMessageText).not.toHaveBeenCalled();
+    expect(h.tg.editMessageReplyMarkup).toHaveBeenCalledWith(TEAM, stale, { reply_markup: { inline_keyboard: [] } });
+    expect(h.tg.answerCallbackQuery).toHaveBeenLastCalledWith('q1', { text: TEXT.closed, show_alert: true });
+    expect(h.events('announce_stale_press')).toHaveLength(1);
+  });
+
+  it('after a team send with no answer, the first copy cannot publish the second copy’s text', async () => {
+    const h = harness();
+    await collect(h);
+    // The first send reached the chat (message 1001) but its answer was lost.
+    h.tg.sendMessage.mockImplementationOnce(async () => {
+      throw new HttpError('Network request failed', new Error('reset'));
+    });
+    h.draft.mockResolvedValueOnce(ok('перший текст')).mockResolvedValueOnce(ok('другий текст'));
+    h.at(min(14));
+    await h.announcer.tick();
+    await h.announcer.tick();
+    const r = h.store.release(1)!;
+    expect(r.state).toBe('drafted');
+    await press(h, 'x', APPROVER, 'q1', TEAM, r.draftMessageId! - 1);
+    await press(h, 'p', APPROVER, 'q2', TEAM, r.draftMessageId! - 1);
+    expect(h.store.release(1)!.state).toBe('drafted');
+    expect(h.channelSends()).toHaveLength(0);
+    await press(h, 'p', APPROVER, 'q3');
+    expect(h.channelSends()).toEqual([['@acme_news', 'другий текст']]);
+  });
+});
+
+describe('a revision whose edit has no answer', () => {
+  it('keeps the new text but withholds Publish until a revision is surely shown', async () => {
+    const h = harness();
+    await drafted(h);
+    h.tg.editMessageText.mockRejectedValueOnce(new HttpError('Network request failed', new Error('timeout')));
+    h.draft.mockResolvedValueOnce(ok('новий текст'));
+    await replyTo(h, 'зміни');
+    const r = h.store.release(1)!;
+    expect(r.state).toBe('drafted');
+    expect(r.draftText).toBe('новий текст');
+    expect(r.flagged).toEqual([TEXT.editUnknown]);
+    expect(h.tg.sendMessage).toHaveBeenLastCalledWith(TEAM, TEXT.revisionUnknown, { reply_to: 500 });
+    expect(h.events('announce_revision_unknown')).toEqual([{ releaseId: 1, error: 'HttpError' }]);
+    await press(h, 'p');
+    expect(h.channelSends()).toHaveLength(0);
+    expect(h.tg.answerCallbackQuery).toHaveBeenLastCalledWith('q1', { text: TEXT.notPublishable, show_alert: true });
+
+    h.draft.mockResolvedValueOnce(ok('третій текст'));
+    await replyTo(h, 'ще раз');
+    expect(h.store.release(1)!.flagged).toEqual([]);
+    await press(h, 'p', APPROVER, 'q2');
+    expect(h.channelSends()).toEqual([['@acme_news', 'третій текст']]);
+  });
+
+  it('a crash while the edit is in flight leaves Publish withheld after restart', async () => {
+    const h = harness();
+    await drafted(h);
+    h.tg.editMessageText.mockImplementationOnce(() => new Promise(() => undefined));
+    h.draft.mockResolvedValueOnce(ok('новий текст'));
+    void replyTo(h, 'зміни');
+    await vi.waitFor(() => expect(h.tg.editMessageText).toHaveBeenCalled());
+    // The process dies here; a new one starts over the same store.
+    h.fresh().startup();
+    expect(h.store.release(1)!.state).toBe('drafted');
+    expect(h.store.release(1)!.flagged).toContain(TEXT.editUnknown);
+    await press(h, 'p');
+    expect(h.channelSends()).toHaveLength(0);
+  });
+
+  it('a definite «no» from Telegram restores the old flags', async () => {
+    const h = harness();
+    await drafted(h);
+    h.tg.editMessageText.mockRejectedValueOnce(grammyNo(400));
+    await replyTo(h, 'зміни');
+    expect(h.store.release(1)!.flagged).toEqual([]);
+    expect(h.store.release(1)!.draftText).toBe(POST);
+  });
+});
+
+describe('polling boundaries', () => {
+  it('a PR merged shortly before the first poll is history, not a release', async () => {
+    const h = harness();
+    await h.announcer.tick();
+    h.pulls['acme/shop-api'] = [h.mkPull('acme/shop-api', 150, min(-3))];
+    h.at(min(3));
+    await h.announcer.tick();
+    expect(h.store.openRelease()).toBeNull();
+    expect(h.store.hasPr('acme/shop-api', 150)).toBe(false);
+  });
+
+  it('later polls overlap two intervals before the cursor', async () => {
+    const h = harness();
+    await h.announcer.tick();
+    h.pulls['acme/shop-api'] = [h.mkPull('acme/shop-api', 210, min(20))];
+    h.at(min(21));
+    await h.announcer.tick();
+    h.at(min(24));
+    await h.announcer.tick();
+    expect(h.github.listMergedPulls).toHaveBeenLastCalledWith('acme/shop-web', 'prod', min(0).toISOString());
+    expect(h.github.listMergedPulls).toHaveBeenCalledWith('acme/shop-api', 'prod', min(14).toISOString());
+  });
+
+  it('a tick that adds a PR does not draft, even when the window has passed', async () => {
+    const h = harness();
+    await collect(h);
+    // Merged at +2, seen late at +14: last merge stays +4, so the window has passed.
+    h.pulls['acme/shop-web'] = [h.mkPull('acme/shop-web', 87, min(2)), h.mkPull('acme/shop-web', 88, min(4))];
+    h.at(min(14));
+    await h.announcer.tick();
+    expect(h.store.prsOf(1)).toHaveLength(3);
+    expect(h.draft).not.toHaveBeenCalled();
+    await h.announcer.tick();
+    expect(h.draft).toHaveBeenCalledTimes(1);
+  });
+
+  it('the post-check retry respects the daily limit', async () => {
+    const h = harness({ dailyLimit: 1 });
+    h.draft.mockResolvedValue(ok('See #512'));
+    await drafted(h);
+    expect(h.draft).toHaveBeenCalledTimes(1);
+    expect(h.store.release(1)!.flagged).toEqual(['номер PR #512']);
+    expect(h.events('announce_draft_flagged')).toEqual([{ releaseId: 1, findings: 1, retry: false }]);
+  });
+
+  it('GitHub: a PR updated exactly at the cursor ends the walk', async () => {
+    const since = '2026-01-15T10:00:00.000Z';
+    const fetchFn = vi.fn(async () =>
+      jsonResponse(
+        Array.from({ length: 50 }, (_, i) =>
+          i === 49
+            ? apiPull(i, { merged_at: '2026-01-15T09:00:00Z', updated_at: '2026-01-15T10:00:00Z' })
+            : apiPull(i, { merged_at: '2026-01-15T11:00:00Z', updated_at: '2026-01-15T11:00:00Z' }),
+        ),
+      ),
+    );
+    const pulls = await new GitHub('t', fetchFn as never).listMergedPulls('a/b', 'main', since);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(pulls).toHaveLength(49);
+  });
+});
+
+describe('post-check, round 2', () => {
+  it.each([
+    ['github.com/acme/shop-api/pull/3', 'посилання на репозиторій'],
+    ['see www.gitlab.com/o/r', 'посилання на репозиторій'],
+    ['PR 512', 'номер PR PR 512'],
+    ['pr#7 merged', 'номер PR pr#7'],
+    ['see pull/512', 'номер PR pull/512'],
+    ['Тікет ABC 12', 'ключ тікета ABC 12'],
+    ['вже на проді', 'службове слово «проді»'],
+    ['викотили на прод', 'службове слово «прод»'],
+    ['на стейджингу', 'службове слово «стейдж*»'],
+    ['GPT-5 тепер відповідає', 'ключ тікета GPT-5'],
+  ])('rejects %j', (text, finding) => expect(checkPost(text, CHECK)).toContain(finding));
+
+  it.each([
+    'PCI DSS compliant payments.',
+    'An undev tool and a CIA report.',
+    'Наш продукт і продажі зросли; продовжуємо.',
+    'Відкрийте стейк-хаус.',
+    'Approve 3 PRs? No: 3 products.',
+    'Visit mygithub.com/page',
+  ])('passes %j', (text) => expect(checkPost(text, CHECK)).toEqual([]));
+
+  it('ANNOUNCE_ALLOW_TERMS lets a product name through the generic key rule only', () => {
+    const allow = { ...CHECK, allow: ['GPT-5', ' iso-8601 '] };
+    expect(checkPost('GPT-5 and ISO-8601 dates', allow)).toEqual([]);
+    expect(checkPost('GPT-6 is next', allow)).toEqual(['ключ тікета GPT-6']);
+    expect(checkPost('ABC-5', { ...CHECK, allow: ['ABC-5'] })).toEqual(['ключ тікета ABC-5']);
+  });
+
+  it('the announcer passes the allow list to the check', async () => {
+    const h = harness({ allowTerms: ['GPT-5'] });
+    h.draft.mockResolvedValue(ok('GPT-5 тепер у чаті.'));
+    await drafted(h);
+    expect(h.store.release(1)!.flagged).toEqual([]);
+    expect(h.draft).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('announce config, round 2', () => {
+  it('reads ANNOUNCE_ALLOW_TERMS', () => {
+    const s = announceSettings(loadConfig({ ...full, ANNOUNCE_ALLOW_TERMS: 'GPT-5, ISO-8601' }));
+    if ('disabled' in s) throw new Error('expected settings');
+    expect(s.allowTerms).toEqual(['GPT-5', 'ISO-8601']);
+  });
+
+  it('rejects a team chat id beyond a safe integer and treats a blank token as missing', () => {
+    expect(() => loadConfig({ ...full, ANNOUNCE_TEAM_CHAT_ID: '-1000000000000000000000' })).toThrow(
+      'invalid environment: ANNOUNCE_TEAM_CHAT_ID',
+    );
+    expect(announceSettings(loadConfig({ ...full, GITHUB_TOKEN: '   ' }))).toEqual({ disabled: true, missing: ['GITHUB_TOKEN'] });
   });
 });

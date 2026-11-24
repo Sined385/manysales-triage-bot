@@ -60,7 +60,14 @@ export const MAX_INPUT_CHARS = 120_000;
 /** A release whose draft fails this many times is given up, so a dead key can't burn the daily limit. */
 export const MAX_DRAFT_ATTEMPTS = 3;
 /** Telegram's limit for one message. */
-const MAX_MESSAGE_CHARS = 4096;
+export const MAX_MESSAGE_CHARS = 4096;
+/** The team note is Claude's; it is shown above the post and must leave the post room. */
+export const MAX_NOTE_CHARS = 300;
+
+const capNote = (note: string): string => {
+  const n = note.trim();
+  return n.length > MAX_NOTE_CHARS ? `${n.slice(0, MAX_NOTE_CHARS - 1)}…` : n;
+};
 
 const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -131,7 +138,7 @@ export async function draftAnnouncement(
 ): Promise<Announcement> {
   const parsed = await ask(client, model, announcePrompt(prompting), buildAnnounceContent(input), AnnouncementSchema);
   const post = parsed.nothing_to_announce ? '' : parsed.post.trim();
-  return { nothing_to_announce: parsed.nothing_to_announce, post, team_note: parsed.team_note.trim() };
+  return { nothing_to_announce: parsed.nothing_to_announce, post, team_note: capNote(parsed.team_note) };
 }
 
 // --- Sources ---
@@ -199,11 +206,21 @@ export interface CheckOptions {
   prodBranch: string;
   jiraBaseUrl: string;
   blocklist: string[];
+  /** Terms the generic ticket-key rule lets through (product names like «GPT-5»). */
+  allow?: string[];
 }
 
-/** Whole word, case-insensitive, Unicode-aware: «dev» is not in «device», «prod» not in «production». */
-const word = (w: string): RegExp =>
-  new RegExp(`(?<![\\p{L}\\p{N}_])${w.trim().split(/\s+/).map(escapeRegExp).join('\\s+')}(?![\\p{L}\\p{N}_])`, 'iu');
+/**
+ * Whole word, case-insensitive, Unicode-aware: «dev» is not in «device»,
+ * «прод» not in «продукт». A trailing `*` makes it a prefix: «стейдж*» also
+ * matches «стейджингу».
+ */
+const word = (w: string): RegExp => {
+  const t = w.trim();
+  const prefix = t.endsWith('*');
+  const core = (prefix ? t.slice(0, -1) : t).trim().split(/\s+/).map(escapeRegExp).join('\\s+');
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${core}${prefix ? '' : '(?![\\p{L}\\p{N}_])'}`, 'iu');
+};
 
 /** What in a post would leak internal work; [] when it is clean. */
 export function checkPost(text: string, opts: CheckOptions): string[] {
@@ -214,12 +231,14 @@ export function checkPost(text: string, opts: CheckOptions): string[] {
   if (text.trim() === '') add('порожній пост');
   if (text.length > MAX_POST_CHARS) add(`задовгий текст (${String(text.length)} > ${String(MAX_POST_CHARS)})`);
 
-  const keyPatterns = [
-    new RegExp(`\\b${escapeRegExp(opts.projectKey)}-\\d+\\b`, 'gi'),
-    /\b[A-Z][A-Z0-9]{1,9}-\d{1,6}\b/g,
-  ];
-  for (const p of keyPatterns) for (const m of text.matchAll(p)) add(`ключ тікета ${m[0]}`);
+  const key = escapeRegExp(opts.projectKey);
+  for (const m of text.matchAll(new RegExp(`\\b${key}(?:-|\\s+)\\d+\\b`, 'gi'))) add(`ключ тікета ${m[0]}`);
+  const allowed = new Set((opts.allow ?? []).map((a) => a.trim().toLowerCase()).filter((a) => a !== ''));
+  for (const m of text.matchAll(/\b[A-Z][A-Z0-9]{1,9}-\d{1,6}\b/g)) {
+    if (!allowed.has(m[0].toLowerCase())) add(`ключ тікета ${m[0]}`);
+  }
   for (const m of text.matchAll(/(?:^|[\s(])(#\d+)\b/g)) add(`номер PR ${m[1]!}`);
+  for (const m of text.matchAll(/\bPR\s*#?\d+\b|\bpull\/\d+\b/gi)) add(`номер PR ${m[0]}`);
 
   const branches = ['stg', 'staging', 'dev', 'prod'];
   const prod = opts.prodBranch.trim().toLowerCase();
@@ -229,7 +248,7 @@ export function checkPost(text: string, opts: CheckOptions): string[] {
   const mainBranch = /\b(main|master)\b\s*(→|->|\/)|(→|->|\/)\s*\b(main|master)\b|\b(main|master) branch\b/i.exec(text);
   if (mainBranch !== null) add(`гілка ${(mainBranch[1] ?? mainBranch[4] ?? mainBranch[5] ?? '').toLowerCase()}`);
 
-  if (/https?:\/\/(www\.)?(github\.com|gitlab\.com|bitbucket\.org)\//i.test(text)) add('посилання на репозиторій');
+  if (/(?<![\w.-])(https?:\/\/)?(www\.)?(github\.com|gitlab\.com|bitbucket\.org)\//i.test(text)) add('посилання на репозиторій');
   let jiraHost = '';
   try {
     jiraHost = new URL(opts.jiraBaseUrl).host.toLowerCase();
@@ -272,6 +291,9 @@ export const TEXT = {
   wait: 'Зачекайте, попередня зміна ще виконується.',
   revisionFailed: 'Не вдалося змінити анонс — подивіться логи бота.',
   revisionEmpty: 'Після змін не лишилось що анонсувати — чернетку не змінено.',
+  /** A finding, not a check result: publishing waits until the team surely sees the text. */
+  editUnknown: 'невідомо, чи оновилась чернетка — змініть її ще раз',
+  revisionUnknown: 'Не вдалося переконатися, що чернетку оновлено — відповідьте на неї ще раз, щоб її можна було опублікувати.',
 } as const;
 
 export type Button = { text: string; callback_data: string };
@@ -285,11 +307,16 @@ export function keyboard(releaseId: number, flagged: string[]): Button[][] {
   return [row];
 }
 
-/** Header lines, a blank line, the post — cut to fit one Telegram message. */
+/**
+ * Header lines, a blank line, the post — in one Telegram message. The header
+ * gives way first: a post that passed the check (≤ MAX_POST_CHARS) is always
+ * shown whole, so the team sees exactly what Publish would post. Only a post
+ * too long to publish anyway (flagged) is cut.
+ */
 export function composeMessage(head: string[], post: string): string {
-  const top = head.filter((l) => l !== '').join('\n');
-  const room = MAX_MESSAGE_CHARS - top.length - 2;
-  const body = post.length > room ? `${post.slice(0, Math.max(0, room - 1))}…` : post;
+  const cut = (s: string, max: number): string => (s.length <= max ? s : `${s.slice(0, Math.max(0, max - 1))}…`);
+  const body = cut(post, MAX_MESSAGE_CHARS - 2 - 100);
+  const top = cut(head.filter((l) => l !== '').join('\n'), MAX_MESSAGE_CHARS - (body === '' ? 0 : body.length + 2));
   return body === '' ? top : `${top}\n\n${body}`;
 }
 
@@ -299,7 +326,7 @@ function draftMessage(r: Pick<Release, 'id' | 'flagged' | 'teamNote' | 'draftTex
       TEXT.header(r.id, prs),
       r.flagged.length > 0 ? TEXT.flagged(r.flagged) : '',
       hintLeft === undefined ? '' : TEXT.editHint(hintLeft),
-      r.teamNote === '' ? '' : TEXT.note(r.teamNote),
+      r.teamNote === '' ? '' : TEXT.note(capNote(r.teamNote)),
     ],
     r.draftText,
   );
@@ -348,7 +375,7 @@ export function routeMessage(i: RouteInput): MessageRoute {
 // --- The announcer: poll → group → draft → approve → publish ---
 
 export interface AnnounceStore {
-  cursor(repo: string): string | null;
+  cursor(repo: string): { since: string; baseline: string } | null;
   setCursor(repo: string, since: string): void;
   openRelease(): Release | null;
   createRelease(lastMergeAt: string, now: string): Release;
@@ -377,6 +404,7 @@ export interface AnnounceTelegram {
     text: string,
     other: { reply_markup: { inline_keyboard: Button[][] } },
   ): Promise<unknown>;
+  editMessageReplyMarkup(chatId: number, messageId: number, other: { reply_markup: { inline_keyboard: Button[][] } }): Promise<unknown>;
   answerCallbackQuery(queryId: string, other?: { text?: string; show_alert?: boolean }): Promise<unknown>;
 }
 
@@ -471,15 +499,18 @@ export class Announcer {
   private async poll(repo: string): Promise<number> {
     const { store, github, log } = this.deps;
     const now = this.deps.now().toISOString();
-    const since = store.cursor(repo);
-    if (since === null) {
+    const cursor = store.cursor(repo);
+    if (cursor === null) {
       // First run: start from now, announce nothing historical.
       store.setCursor(repo, now);
       log('announce_baseline', { repo });
       return 0;
     }
+    const since = cursor.since;
     // A small overlap covers merges that became visible late; the PR table dedupes.
-    const from = new Date(Date.parse(since) - 2 * this.s.pollMinutes * 60_000).toISOString();
+    // Never before the first poll, though: what merged before it is history.
+    const overlap = new Date(Date.parse(since) - 2 * this.s.pollMinutes * 60_000).toISOString();
+    const from = overlap > cursor.baseline ? overlap : cursor.baseline;
     let pulls: Pull[];
     try {
       pulls = await github.listMergedPulls(repo, this.s.prodBranch, from);
@@ -495,7 +526,7 @@ export class Announcer {
     for (const p of merged) {
       this.remember(p);
       if (p.mergedAt > newest) newest = p.mergedAt;
-      if (store.hasPr(repo, p.number)) continue;
+      if (p.mergedAt <= cursor.baseline || store.hasPr(repo, p.number)) continue;
       const release = store.openRelease() ?? store.createRelease(p.mergedAt, now);
       if (store.addPr(repo, p.number, p.mergedAt, release.id)) {
         added++;
@@ -556,19 +587,24 @@ export class Announcer {
       prodBranch: this.s.prodBranch,
       jiraBaseUrl: this.s.jiraBaseUrl,
       blocklist: this.s.blocklist,
+      allow: this.s.allowTerms,
     });
   }
 
   /** One call, and one more if the post-check rejects the post (and the daily limit allows). */
   private async compose(releaseId: number, input: AnnounceInput): Promise<{ result: Announcement; findings: string[] }> {
-    let result = await this.deps.draft(input);
+    const call = async (i: AnnounceInput): Promise<Announcement> => {
+      const r = await this.deps.draft(i);
+      return { ...r, team_note: capNote(r.team_note) };
+    };
+    let result = await call(input);
     if (result.nothing_to_announce) return { result, findings: [] };
     let findings = this.check(result.post);
     if (findings.length === 0) return { result, findings };
     const retry = this.takeRun();
     this.deps.log('announce_draft_flagged', { releaseId, findings: findings.length, retry });
     if (!retry) return { result, findings };
-    result = await this.deps.draft({ ...input, previousPost: result.post, findings });
+    result = await call({ ...input, previousPost: result.post, findings });
     if (result.nothing_to_announce) return { result, findings: [] };
     findings = this.check(result.post);
     if (findings.length > 0) this.deps.log('announce_draft_flagged', { releaseId, findings: findings.length, retry: false });
@@ -677,7 +713,14 @@ export class Announcer {
    * A button press. Everything up to the state change runs before the first
    * await, so two presses — even at once — can't both pass the guard.
    */
-  async onCallback(q: { id: string; data: string; chatId: number | undefined; user: Presser }): Promise<void> {
+  async onCallback(q: {
+    id: string;
+    data: string;
+    chatId: number | undefined;
+    /** The message the button is on. */
+    messageId: number | undefined;
+    user: Presser;
+  }): Promise<void> {
     const m = /^an:([pex]):(\d+)$/.exec(q.data);
     if (m === null) return;
     const action = m[1] === 'p' ? 'publish' : m[1] === 'e' ? 'edit' : 'cancel';
@@ -689,6 +732,17 @@ export class Announcer {
     const r = this.deps.store.release(id);
     if (r === null) return this.answer(q.id, id, TEXT.closed, true);
     if (q.chatId !== r.chatId) return this.answer(q.id, id);
+    if (q.messageId !== r.draftMessageId) {
+      // A stale copy (a draft sent twice after an unanswered send): its buttons
+      // would act on text it doesn't show. Disarm it; the release is untouched.
+      this.deps.log('announce_stale_press', { releaseId: id, userId: q.user.id, action });
+      if (q.messageId !== undefined && q.chatId !== undefined) {
+        await this.deps.tg
+          .editMessageReplyMarkup(q.chatId, q.messageId, { reply_markup: { inline_keyboard: [] } })
+          .catch((err: unknown) => this.deps.log('announce_edit_failed', { releaseId: id, error: errorName(err) }));
+      }
+      return this.answer(q.id, id, TEXT.closed, true);
+    }
     if (action === 'publish') return this.publish(q.id, r, q.user);
     if (action === 'edit') return this.startEdit(q.id, r);
     return this.cancel(q.id, r, q.user);
@@ -783,8 +837,34 @@ export class Announcer {
         return say(TEXT.revisionEmpty);
       }
       const next = { id: r.id, flagged: findings, teamNote: result.team_note, draftText: result.post };
-      // The approver must see exactly what Publish would post: no saved text without the edit.
-      await this.edit(r, draftMessage(next, store.prsOf(r.id).length), keyboard(r.id, findings), true);
+      const prs = store.prsOf(r.id).length;
+      // The approver must see exactly what Publish would post. Until the edit
+      // is known to have landed, the release is flagged, so a crash or an
+      // unanswered edit can't leave Publish posting text the team doesn't see.
+      store.saveDraft(r.id, {
+        chatId,
+        messageId: r.draftMessageId,
+        text: r.draftText,
+        note: r.teamNote,
+        flagged: [...r.flagged, TEXT.editUnknown],
+        revisions: r.revisions,
+      });
+      try {
+        await this.edit(r, draftMessage(next, prs), keyboard(r.id, findings), true);
+      } catch (err) {
+        if (err instanceof GrammyError) {
+          // Telegram said no: the old text is still what the team sees.
+          save(r.draftText, r.teamNote, r.flagged);
+          throw err;
+        }
+        // No answer: the team may see either text. Keep the new one, withheld from Publish.
+        const unsure = [TEXT.editUnknown, ...findings];
+        save(result.post, result.team_note, unsure);
+        await this.edit(r, draftMessage({ ...next, flagged: unsure }, prs), keyboard(r.id, unsure));
+        store.setState(r.id, ['revising'], 'drafted');
+        log('announce_revision_unknown', { releaseId: r.id, error: errorName(err) });
+        return say(TEXT.revisionUnknown);
+      }
       save(result.post, result.team_note, findings);
       store.setState(r.id, ['revising'], 'drafted');
       log('announce_revised', { releaseId: r.id, revisions, flagged: findings.length });

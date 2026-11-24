@@ -7,7 +7,7 @@
  * The file holds `{ promotions: Pull[], linked: Pull[], issues: {key, summary, description}[] }`.
  * A `draft.txt` beside it is run through the post-check. PRODUCT_CONTEXT,
  * ANNOUNCE_STYLE, ANNOUNCE_LANGUAGE, JIRA_PROJECT_KEY, JIRA_BASE_URL,
- * ANNOUNCE_PROD_BRANCH and ANNOUNCE_BLOCKLIST are read from the environment.
+ * ANNOUNCE_PROD_BRANCH, ANNOUNCE_BLOCKLIST and ANNOUNCE_ALLOW_TERMS are read from the environment.
  */
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -33,6 +33,7 @@ export function renderSample(path: string, env: NodeJS.ProcessEnv): string {
       prodBranch: env.ANNOUNCE_PROD_BRANCH ?? 'main',
       jiraBaseUrl: env.JIRA_BASE_URL ?? '',
       blocklist: (env.ANNOUNCE_BLOCKLIST ?? DEFAULT_BLOCKLIST).split(',').map((w) => w.trim()).filter((w) => w !== ''),
+      allow: (env.ANNOUNCE_ALLOW_TERMS ?? '').split(',').map((w) => w.trim()).filter((w) => w !== ''),
     });
     out.push('', '=== post-check of draft.txt ===', findings.length === 0 ? 'clean' : findings.map((f) => `- ${f}`).join('\n'));
   }

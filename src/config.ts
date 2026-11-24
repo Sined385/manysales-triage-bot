@@ -19,7 +19,10 @@ const csv = (fallback: string) =>
     .transform((s) => s.split(',').map((x) => x.trim()).filter((x) => x !== ''));
 
 /** Words the announcement post-check rejects besides ticket keys, PR numbers, branches and repo links. */
-export const DEFAULT_BLOCKLIST = 'staging,stg,prod,dev,eval,hotfix,refactor,merge,pull request,CI,QA';
+// Whole words, case-insensitive; a trailing `*` matches as a prefix. The Cyrillic ones
+// are the usual Ukrainian slang for the default language `uk` («на проді», «на стейджингу»).
+export const DEFAULT_BLOCKLIST =
+  'staging,stg,prod,dev,eval,hotfix,refactor,merge,pull request,CI,QA,прод,проді,проду,прода,продом,стейдж*,стейджинг*,стг';
 
 const EnvSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
@@ -78,7 +81,10 @@ const EnvSchema = z.object({
     'must be comma-separated owner/name',
   ),
   // Fine-grained token with Pull requests: read and Metadata: read on those repos.
-  GITHUB_TOKEN: z.string().default(''),
+  GITHUB_TOKEN: z
+    .string()
+    .default('')
+    .transform((s) => s.trim()),
   // The public channel posts go to: `-100…` or `@username`. The bot must be its admin with «Post messages».
   ANNOUNCE_CHANNEL_ID: z
     .string()
@@ -88,7 +94,7 @@ const EnvSchema = z.object({
   ANNOUNCE_TEAM_CHAT_ID: z
     .string()
     .default('')
-    .refine((s) => s.trim() === '' || /^-?\d+$/.test(s.trim()), 'must be an integer chat id')
+    .refine((s) => s.trim() === '' || (/^-?\d+$/.test(s.trim()) && Number.isSafeInteger(Number(s.trim()))), 'must be an integer chat id')
     .transform((s) => (s.trim() === '' ? undefined : Number(s.trim()))),
   // Who may publish, change or cancel a draft; empty = ALLOWED_USER_IDS.
   ANNOUNCE_APPROVER_IDS: csvIds,
@@ -104,6 +110,8 @@ const EnvSchema = z.object({
   ANNOUNCE_MAX_LINKED_PRS: z.coerce.number().int().min(0).max(100).default(30),
   ANNOUNCE_MAX_ISSUES: z.coerce.number().int().min(0).max(100).default(30),
   ANNOUNCE_BLOCKLIST: csv(DEFAULT_BLOCKLIST),
+  // Names the ticket-key check would reject but the post may use («GPT-5»), comma-separated.
+  ANNOUNCE_ALLOW_TERMS: csv(''),
 });
 
 export type Config = z.infer<typeof EnvSchema>;
@@ -135,6 +143,7 @@ export interface AnnounceSettings {
   maxLinkedPrs: number;
   maxIssues: number;
   blocklist: string[];
+  allowTerms: string[];
   projectKey: string;
   jiraBaseUrl: string;
   timeZone: string;
@@ -176,6 +185,7 @@ export function announceSettings(cfg: Config): AnnounceSettings | { disabled: tr
     maxLinkedPrs: cfg.ANNOUNCE_MAX_LINKED_PRS,
     maxIssues: cfg.ANNOUNCE_MAX_ISSUES,
     blocklist: cfg.ANNOUNCE_BLOCKLIST,
+    allowTerms: cfg.ANNOUNCE_ALLOW_TERMS,
     projectKey: cfg.JIRA_PROJECT_KEY,
     jiraBaseUrl: cfg.JIRA_BASE_URL,
     timeZone: cfg.TIME_ZONE,

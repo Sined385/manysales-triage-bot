@@ -81,6 +81,7 @@ const announcer =
               reply_markup: other.reply_markup,
               link_preview_options: { is_disabled: true },
             }),
+          editMessageReplyMarkup: (chatId, messageId, other) => bot.api.editMessageReplyMarkup(chatId, messageId, other),
           answerCallbackQuery: (queryId, other) => bot.api.answerCallbackQuery(queryId, other),
         },
         log,
@@ -217,12 +218,14 @@ async function handleRun(
 }
 
 bot.on('callback_query:data', (ctx) => {
-  if (announcer === null) return;
+  // Off: still answer, or the client spins on an old draft's button.
+  if (announcer === null) return void ctx.answerCallbackQuery().catch(() => undefined);
   // Not awaited: a publish waits on Telegram, and the group must keep being recorded meanwhile.
   void announcer.onCallback({
     id: ctx.callbackQuery.id,
     data: ctx.callbackQuery.data,
     chatId: ctx.callbackQuery.message?.chat.id,
+    messageId: ctx.callbackQuery.message?.message_id,
     user: { id: ctx.from.id, name: authorOf(ctx) },
   });
 });
@@ -230,7 +233,9 @@ bot.on('callback_query:data', (ctx) => {
 bot.catch((err) => log('bot_error', { error: errorName(err.error) }));
 
 let pollTimer: NodeJS.Timeout | undefined;
+let stopped = false;
 const stop = (): void => {
+  stopped = true;
   clearTimeout(pollTimer);
   void bot.stop();
 };
@@ -251,6 +256,8 @@ if ('disabled' in settings) {
   // A chain, not an interval: a slow tick delays the next one instead of overlapping it.
   const loop = async (): Promise<void> => {
     await announcer.tick();
+    // A tick still running at SIGTERM must not schedule another.
+    if (stopped) return;
     pollTimer = setTimeout(() => void loop(), settings.pollMinutes * 60_000);
   };
   void loop();

@@ -50,7 +50,8 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS gh_cursor (
         repo TEXT PRIMARY KEY,
-        since TEXT NOT NULL
+        since TEXT NOT NULL,
+        baseline TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS releases (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,16 +175,24 @@ export class Store {
 
   // --- Release announcements ---
 
-  /** The newest merge time already seen in a repo; null before the first poll. */
-  cursor(repo: string): string | null {
-    const row = this.db.prepare('SELECT since FROM gh_cursor WHERE repo = ?').get(repo) as { since: string } | undefined;
-    return row?.since ?? null;
+  /**
+   * The newest merge time already seen in a repo, and when the repo was first
+   * polled (nothing merged before that is announced); null before the first poll.
+   */
+  cursor(repo: string): { since: string; baseline: string } | null {
+    const row = this.db.prepare('SELECT since, baseline FROM gh_cursor WHERE repo = ?').get(repo) as
+      | { since: string; baseline: string }
+      | undefined;
+    return row === undefined ? null : { since: row.since, baseline: row.baseline };
   }
 
+  /** The first call for a repo also sets its baseline; later calls move only `since`. */
   setCursor(repo: string, since: string): void {
     this.db
-      .prepare('INSERT INTO gh_cursor (repo, since) VALUES (?, ?) ON CONFLICT(repo) DO UPDATE SET since = excluded.since')
-      .run(repo, since);
+      .prepare(
+        'INSERT INTO gh_cursor (repo, since, baseline) VALUES (?, ?, ?) ON CONFLICT(repo) DO UPDATE SET since = excluded.since',
+      )
+      .run(repo, since, since);
   }
 
   /** The release still collecting merges; there is at most one. */
